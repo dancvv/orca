@@ -67,6 +67,7 @@ export const LOCALIZATION_SURFACES = {
       path.join('src', 'shared', 'bots', 'bot-app-lines.ts'),
       path.join('src', 'shared', 'bots', 'bot-tool-draft.ts'),
       path.join('src', 'shared', 'bot-tools.ts'),
+      path.join('src', 'shared', 'bot-tool-paste.ts'),
       path.join('src', 'shared', 'bot-tool-sign-in.ts'),
       path.join('src', 'shared', 'connectors', 'connector-message-asker-view.ts'),
       path.join('src', 'shared', 'agent-session', 'journal', 'agent-journal-typed-by.ts'),
