@@ -83,16 +83,16 @@ export function openJournal() {
      VALUES('workspace','chat-1','e',10,1)`
   ).run()
   const journal: ConnectorReplyCutJournal = {
-    read: async (sessionId) =>
-      readJournalConnectorReplies(db).filter(
-        (row) => sessionId === undefined || row.sessionId === sessionId
-      ),
+    read: async (sessionId) => readJournalConnectorReplies(db, sessionId),
     readOwed: async (account, after, limit) =>
       readOwedJournalConnectorReplies(db, account, after, limit),
-    fillOutcomes: async (fills) => fillJournalConnectorReplies(db, fills, NOW) > 0,
+    // A write asks its admit as the writer takes it, as the journal's lane does.
+    fillOutcomes: async (fills, admit) =>
+      admit?.() !== false && fillJournalConnectorReplies(db, fills, NOW) > 0,
     sent: async (keys) => sentJournalConnectorReplies(db, keys, NOW),
-    cut: async (rows) => cutJournalConnectorReplies(db, rows) > 0,
-    recut: async (claim, cut, failure) => recutJournalConnectorReplies(db, claim, cut, failure) > 0,
+    cut: async (rows, admit) => admit?.() !== false && cutJournalConnectorReplies(db, rows) > 0,
+    recut: async (claim, cut, failure, admit) =>
+      admit?.() !== false && recutJournalConnectorReplies(db, claim, cut, failure) > 0,
     releaseClaim: async (claim) => releaseJournalConnectorClaim(db, claim) > 0,
     holdForRetry: async (rows) => holdJournalConnectorRepliesForRetry(db, rows) > 0
   }
@@ -157,6 +157,8 @@ export function start(
     bot?: boolean
     /** An empty turn's retry: whether the chat tried a post itself, and how its ask's send goes. */
     retry?: { posted?: boolean; send: EmptyRetrySend }
+    /** When this process started: a request admitted earlier crossed a restart. */
+    processStartedAt?: number
   } = {}
 ) {
   const { bot = false, retry: retrying, ...recoveryOptions } = options
@@ -192,7 +194,8 @@ export function start(
     () => {},
     usageLimitReplyPause(() => journal, options.usageLimitDisposition ?? (async () => 'ended')),
     undefined,
-    retry
+    retry,
+    { processStartedAt: options.processStartedAt }
   )
   const recovery: ConnectorReplyRecovery = new ConnectorReplyRecovery({
     ...(retry ? { retrySending: retry.sending } : {}),
@@ -225,7 +228,7 @@ export function start(
               itemId: `said-${key}`,
               revision: 1,
               sequence: at,
-              observedAt: at,
+              observedAt: NOW + at,
               body: {
                 kind: 'message' as const,
                 role: 'assistant' as const,
@@ -239,7 +242,7 @@ export function start(
         itemId: key,
         revision: 1,
         sequence: at + 1,
-        observedAt: at + 1,
+        observedAt: NOW + at + 1,
         body: {
           kind: 'turn',
           turnId: `provider-${key}`,

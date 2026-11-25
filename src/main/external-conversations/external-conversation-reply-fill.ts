@@ -18,6 +18,7 @@ import { isSlackDirectMessage } from '../../shared/connectors/slack-direct-messa
 import type { EmptyTurnRetry } from './external-conversation-reply-empty-retry'
 import type { AgentJournalMessageItem } from '../../shared/agent-session/journal/agent-session-journal-types'
 import { agentJournalSubmissionKey } from '../../shared/agent-session/journal/agent-session-journal-item-key'
+import { PROCESS_STARTED_AT, staleCloser } from './external-conversation-reply-freshness'
 
 export type EndedTurnReplies = {
   sessionId: string
@@ -47,6 +48,12 @@ export type EndedTurnReplies = {
   live?: true
   /** How a retry of the turn is asked (retryAskerOf): absent when the turn gets none. */
   askedBy?: Pick<AgentJournalMessageItem, 'origin' | 'asker' | 'connectorConversation'>
+  /** A fill recovery makes from an ended turn, and when that turn ended: too old to post, its rows
+   *  close quietly (REPLY_FRESH_MS). */
+  recovered?: { endedAt: number }
+  /** A recovery pass's fill: whether that pass is still current. Asked when each write reaches the
+   *  writer; a stale pass's fill writes nothing. */
+  current?: () => boolean
 }
 
 /** What a fill did: the conversations its rows cover, and whether a usage-limit pause cut them
@@ -84,6 +91,7 @@ export type UsageLimitPause = (
 ) => Promise<false | { resumesAt?: number }>
 
 const keyOf = (account: string, deliveryId: string): string => `${account}\0${deliveryId}`
+const rowKey = (row: JournalConnectorReplyRow): string => keyOf(row.account, row.deliveryId)
 
 /**
  * Takes the session's rows the turn's stamps name and fills the unfilled ones. Returns the
@@ -95,7 +103,8 @@ export function conversationReplyFill(
   filled: () => void,
   pause?: UsageLimitPause,
   askedByOwner?: AskedByOwner,
-  retry?: Pick<EmptyTurnRetry, 'hold' | 'posted'>
+  retry?: Pick<EmptyTurnRetry, 'hold' | 'posted'>,
+  options: { processStartedAt?: number } = {}
 ): ConversationReplyFill {
   return async (turn) => {
     const store = journal()
@@ -122,15 +131,6 @@ export function conversationReplyFill(
           (order.get(keyOf(a.account, a.deliveryId)) ?? 0) -
           (order.get(keyOf(b.account, b.deliveryId)) ?? 0)
       )
-    // The group's head keys its answer: its earliest stamp per conversation, filled or sent or not,
-    // so a partial fill or a deleted row never moves the key.
-    const answers = new Map<string, string>()
-    for (const stamp of turn.stamps) {
-      const conversation = JSON.stringify([stamp.account, stamp.conversation])
-      if (!answers.has(conversation)) {
-        answers.set(conversation, stamp.deliveryId)
-      }
-    }
     const covered = new Set(rows.map((row) => row.conversation.externalId))
     // A row a continuation claimed is that continuation's turn's to fill; one a cut still owes is
     // its continuation's or its close's.
@@ -180,6 +180,26 @@ export function conversationReplyFill(
           (await askedByOwner?.(turn.sessionId, row.messageId).catch(() => false)) === true)
       silencedWhole.set(conversation, row.quietRule === undefined && !ownerDm)
     }
+    // Too old to post: closes quietly under its own key, never the answer's, so accepting the
+    // answer's event never takes a request it didn't answer (item 964).
+    const closer = staleCloser(options.processStartedAt ?? PROCESS_STARTED_AT)
+    const stale = new Set(
+      own.filter((row) => closer.isStale(row, turn.recovered?.endedAt)).map(rowKey)
+    )
+    // The group's head keys its answer: its earliest stamp per conversation, filled or sent or not,
+    // so a partial fill or a deleted row never moves the key; a request closed as too old never is.
+    const byKey = new Map(rows.map((row) => [rowKey(row), row]))
+    const answers = new Map<string, string>()
+    for (const stamp of turn.stamps) {
+      const conversation = JSON.stringify([stamp.account, stamp.conversation])
+      for (const deliveryId of [stamp.deliveryId, ...(stamp.carried ?? [])]) {
+        const row = byKey.get(keyOf(stamp.account, deliveryId))
+        const expired = row && (stale.has(rowKey(row)) || row.fill?.expiredReason !== undefined)
+        if (!answers.has(conversation) && !expired) {
+          answers.set(conversation, deliveryId)
+        }
+      }
+    }
     const fills: JournalConnectorReplyFill[] = []
     for (const row of own) {
       const conversation = JSON.stringify([row.account, row.conversation])
@@ -187,8 +207,11 @@ export function conversationReplyFill(
         ...answeredIn(row),
         silencedWhole: silencedWhole.get(conversation) === true
       })
-      const answerDeliveryId = answers.get(conversation) ?? row.deliveryId
-      fills.push({
+      const expired = stale.has(rowKey(row))
+      const answerDeliveryId = expired
+        ? row.deliveryId
+        : (answers.get(conversation) ?? row.deliveryId)
+      const fill: JournalConnectorReplyFill = {
         account: row.account,
         deliveryId: row.deliveryId,
         ...(claimedHere(row) ? { expect: { claimMessageId: row.claimMessageId! } } : {}),
@@ -201,9 +224,10 @@ export function conversationReplyFill(
         ...(outcome === 'answered' && turn.tookMs !== undefined ? { tookMs: turn.tookMs } : {}),
         ...(outcome === 'no_answer' && turn.toolsRan ? { toolsRan: true as const } : {}),
         ...(turn.turnStartedAt === undefined ? {} : { turnStartedAt: turn.turnStartedAt })
-      })
+      }
+      fills.push(expired ? closer.close(row, fill, turn.recovered?.endedAt) : fill)
     }
-    if (await store.fillOutcomes(fills)) {
+    if (await closer.write(store, turn.sessionId, fills, turn.current)) {
       filled()
     }
     return { covered, paused: false }

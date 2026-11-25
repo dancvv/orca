@@ -24,7 +24,8 @@ export function recordJournalConnectorReplies(
   target: Target,
   messageId: string,
   queued: boolean,
-  body: AgentJournalMessageItem
+  body: AgentJournalMessageItem,
+  admittedAt: number
 ): void {
   claimJournalConnectorReplies(db, target, messageId, body)
   const stamp = body.connectorDelivery
@@ -32,8 +33,8 @@ export function recordJournalConnectorReplies(
     return
   }
   const insert = db.prepare(`INSERT INTO journal_connector_replies
-    (account,delivery_id,source,external_id,session_id,epoch,message_id,queued,quiet_rule)
-    VALUES(?,?,?,?,?,?,?,?,'trailing') ON CONFLICT(account,delivery_id) DO NOTHING`)
+    (account,delivery_id,source,external_id,session_id,epoch,message_id,queued,quiet_rule,admitted_at)
+    VALUES(?,?,?,?,?,?,?,?,'trailing',?) ON CONFLICT(account,delivery_id) DO NOTHING`)
   for (const deliveryId of [stamp.deliveryId, ...(stamp.carried ?? [])]) {
     insert.run(
       stamp.account,
@@ -43,7 +44,8 @@ export function recordJournalConnectorReplies(
       target.sessionId,
       target.epoch,
       messageId,
-      Number(queued)
+      Number(queued),
+      admittedAt
     )
   }
 }
@@ -53,6 +55,9 @@ export function recordJournalConnectorReplies(
 const EXPECT_OPEN = 'cut_turn_id IS NULL AND claim_message_id IS NULL'
 const EXPECT_CLAIMED = 'claim_message_id=?'
 const EXPECT_CUT = 'cut_turn_id=? AND claim_message_id IS NULL'
+// A usage-limit cut marks its rows paused for good: a write that changes the cut keeps the mark,
+// read from the cut it replaces (SET reads the old row) or the one it writes (the bound kind).
+const PAUSED = `paused=CASE WHEN cut_kind='usage_limit' OR ?='usage_limit' THEN 1 ELSE paused END`
 
 /** A continuation's admission claims the unclaimed rows its cut owes: those already cut, and the
  *  still open ones its claim names (the cut's own deliveries, which a classification after the
@@ -75,11 +80,11 @@ export function claimJournalConnectorReplies(
     cutTurnId
   )
   const open = db.prepare(`UPDATE journal_connector_replies
-    SET claim_message_id=?,cut_turn_id=?,cut_kind=?
+    SET ${PAUSED},claim_message_id=?,cut_turn_id=?,cut_kind=?
     WHERE session_id=? AND account=? AND delivery_id=? AND outcome IS NULL AND ${EXPECT_OPEN}`)
   for (const stamp of claim.origin) {
     for (const deliveryId of [stamp.deliveryId, ...(stamp.carried ?? [])]) {
-      open.run(messageId, cutTurnId, cutKind, target.sessionId, stamp.account, deliveryId)
+      open.run(cutKind, messageId, cutTurnId, cutKind, target.sessionId, stamp.account, deliveryId)
     }
   }
 }
@@ -110,7 +115,7 @@ export function fillJournalConnectorReplies(
   const fillWhere = (expect: string) =>
     db.prepare(`UPDATE journal_connector_replies SET outcome=?,answer_delivery_id=?,
     turn_item_id=?,prose=?,failure_json=?,links_json=?,took_ms=?,turn_started_at=?,
-    tools_ran=COALESCE(?,tools_ran),filled_at=? WHERE account=? AND delivery_id=? AND outcome IS NULL AND ${expect}`)
+    tools_ran=COALESCE(?,tools_ran),expired_reason=?,filled_at=? WHERE account=? AND delivery_id=? AND outcome IS NULL AND ${expect}`)
   const open = fillWhere(EXPECT_OPEN)
   const claimed = fillWhere(EXPECT_CLAIMED)
   const owed = fillWhere(EXPECT_CUT)
@@ -134,6 +139,7 @@ export function fillJournalConnectorReplies(
         row.tookMs ?? null,
         row.turnStartedAt ?? null,
         row.toolsRan ? 1 : null,
+        row.expiredReason ?? null,
         now,
         row.account,
         row.deliveryId,
@@ -153,12 +159,13 @@ export function cutJournalConnectorReplies(
   { keys, cut, failure }: JournalConnectorReplyCutRows
 ): number {
   const mark =
-    db.prepare(`UPDATE journal_connector_replies SET cut_turn_id=?,cut_kind=?,failure_json=?
+    db.prepare(`UPDATE journal_connector_replies SET ${PAUSED},cut_turn_id=?,cut_kind=?,failure_json=?
     WHERE account=? AND delivery_id=? AND outcome IS NULL AND ${EXPECT_OPEN}`)
   let changed = 0
   for (const key of keys) {
     changed += Number(
-      mark.run(cut.turnId, cut.kind, failureJson(failure), key.account, key.deliveryId).changes
+      mark.run(cut.kind, cut.turnId, cut.kind, failureJson(failure), key.account, key.deliveryId)
+        .changes
     )
   }
   return changed
@@ -170,12 +177,12 @@ export function holdJournalConnectorRepliesForRetry(
   db: Database.Database,
   { keys, claims, cut }: JournalConnectorReplyRetryRows
 ): number {
-  const set = `cut_turn_id=?,cut_kind=?,empty_retried=1`
+  const set = `${PAUSED},cut_turn_id=?,cut_kind=?,empty_retried=1`
   const open = db.prepare(`UPDATE journal_connector_replies SET ${set}
     WHERE account=? AND delivery_id=? AND outcome IS NULL AND empty_retried IS NULL AND ${EXPECT_OPEN}`)
   const claimed = db.prepare(`UPDATE journal_connector_replies SET ${set},claim_message_id=NULL
     WHERE claim_message_id=? AND outcome IS NULL AND empty_retried IS NULL`)
-  const marks = [cut.turnId, cut.kind] as const
+  const marks = [cut.kind, cut.turnId, cut.kind] as const
   let held = 0
   for (const key of keys) {
     held += Number(open.run(...marks, key.account, key.deliveryId).changes)
@@ -197,9 +204,10 @@ export function recutJournalConnectorReplies(
 ): number {
   return Number(
     db
-      .prepare(`UPDATE journal_connector_replies SET cut_turn_id=?,cut_kind=?,claim_message_id=NULL,
-        failure_json=COALESCE(?,failure_json) WHERE claim_message_id=? AND outcome IS NULL`)
-      .run(cut.turnId, cut.kind, failureJson(failure), claimMessageId).changes
+      .prepare(`UPDATE journal_connector_replies SET ${PAUSED},cut_turn_id=?,cut_kind=?,
+        claim_message_id=NULL,failure_json=COALESCE(?,failure_json)
+        WHERE claim_message_id=? AND outcome IS NULL`)
+      .run(cut.kind, cut.turnId, cut.kind, failureJson(failure), claimMessageId).changes
   )
 }
 

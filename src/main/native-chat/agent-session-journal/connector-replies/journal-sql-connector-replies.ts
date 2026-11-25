@@ -1,5 +1,6 @@
 import type { ConnectorFailure } from '../../../../shared/connectors/connector-cloud-contract'
 import type {
+  JournalConnectorReplyAdmit,
   JournalConnectorReplyCut,
   JournalConnectorReplyCutRows,
   JournalConnectorReplyFill,
@@ -68,28 +69,41 @@ export class JournalSqlConnectorReplies {
   }
 
   /** Fills rows with their outcomes, the first fill winning; whether any changed. */
-  async fillOutcomes(fills: readonly JournalConnectorReplyFill[]): Promise<boolean> {
+  async fillOutcomes(
+    fills: readonly JournalConnectorReplyFill[],
+    admit?: JournalConnectorReplyAdmit
+  ): Promise<boolean> {
     if (this.db.readOnly || fills.length === 0) {
       return false
     }
     const result = await this.db.serialize(LANE, (writer) =>
-      writer.maintain({ kind: 'connector-replies-fill', fills, now: Date.now() })
+      admit?.() === false
+        ? false
+        : writer.maintain({ kind: 'connector-replies-fill', fills, now: Date.now() })
     )
     return result === true
   }
 
   /** Open rows a cut now owes a continuation; whether any changed. */
-  async cut(rows: JournalConnectorReplyCutRows): Promise<boolean> {
-    return await this.maintain({ kind: 'connector-replies-cut', rows }, rows.keys.length)
+  async cut(
+    rows: JournalConnectorReplyCutRows,
+    admit?: JournalConnectorReplyAdmit
+  ): Promise<boolean> {
+    return await this.maintain({ kind: 'connector-replies-cut', rows }, rows.keys.length, admit)
   }
 
   /** The continuation's own turn was cut and is owed again: its claimed rows become that cut's. */
   async recut(
     claimMessageId: string,
     cut: JournalConnectorReplyCut,
-    failure?: ConnectorFailure
+    failure?: ConnectorFailure,
+    admit?: JournalConnectorReplyAdmit
   ): Promise<boolean> {
-    return await this.maintain({ kind: 'connector-replies-recut', claimMessageId, cut, failure })
+    return await this.maintain(
+      { kind: 'connector-replies-recut', claimMessageId, cut, failure },
+      1,
+      admit
+    )
   }
 
   /** An empty turn's rows, held for its one retry to claim; whether any changed. */
@@ -105,11 +119,18 @@ export class JournalSqlConnectorReplies {
     return await this.maintain({ kind: 'connector-replies-release', claimMessageId })
   }
 
-  private async maintain(operation: JournalSqlMaintenance, size = 1): Promise<boolean> {
+  private async maintain(
+    operation: JournalSqlMaintenance,
+    size = 1,
+    admit?: JournalConnectorReplyAdmit
+  ): Promise<boolean> {
     if (this.db.readOnly || size === 0) {
       return false
     }
-    return (await this.db.serialize(LANE, (writer) => writer.maintain(operation))) === true
+    const result = await this.db.serialize(LANE, (writer) =>
+      admit?.() === false ? false : writer.maintain(operation)
+    )
+    return result === true
   }
 
   /** The cloud accepted these rows. */
