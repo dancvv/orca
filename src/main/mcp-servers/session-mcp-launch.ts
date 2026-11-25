@@ -26,8 +26,7 @@ async function hostServersFor(
   }
   const folder = given ?? mcpHostListFolder()
   try {
-    const servers = await mcpServersForLaunch(agent, workspace, folder)
-    return { folder, servers }
+    return { folder, ...(await mcpServersForLaunch(agent, workspace, folder)) }
   } catch (error) {
     // A broken list never stops a chat starting; its settings page shows the file's problem.
     console.warn(

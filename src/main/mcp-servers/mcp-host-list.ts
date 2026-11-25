@@ -30,9 +30,9 @@ import { classifyAddedBotTool } from '../bots/tool-oauth/bot-tool-owned-sign-in'
 import { mcpHostListFolder } from './mcp-host-list-folder'
 import { McpServersError } from './mcp-servers-error'
 import { assertNotFromPlugin, pluginViewOf } from './mcp-plugin-server-mark'
+import { ID_PATTERN, sharedIds, type McpLaunchServers } from './mcp-shared-process-servers'
 
 const AgentFilesSchema = z.record(z.string(), z.unknown())
-const ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/
 // An entry whose workspaces Orca can't read is on nowhere, never everywhere.
 const NO_WORKSPACES: McpServerWorkspaces = { later: false, on: [], off: [] }
 
@@ -344,13 +344,14 @@ export async function mcpServersForLaunch(
   agent: string,
   workspace: { key: string | null } | 'any',
   folder = mcpHostListFolder()
-): Promise<BotToolServer[]> {
+): Promise<McpLaunchServers> {
   // Read only: a launch never writes the list, even to give an entry edited outside Orca its id.
-  return botToolEntries(await readBotToolsSnapshot(folder)).flatMap(({ server, extras }) => {
+  const entries = botToolEntries(await readBotToolsSnapshot(folder)).filter(({ extras }) => {
     const settings = settingsOf(extras)
-    const on =
+    return (
       !settings.agentsOff.includes(agent) &&
       (workspace === 'any' || isMcpServerOnInWorkspace(settings.workspaces, workspace.key))
-    return on ? [server] : []
+    )
   })
+  return { servers: entries.map(({ server }) => server), sharedProcesses: sharedIds(entries) }
 }

@@ -39,6 +39,7 @@ import { McpServersError } from '../../../mcp-servers/mcp-servers-error'
 import { assertMcpServersFeatureEnabled } from '../../../mcp-servers/mcp-servers-feature'
 import { mcpHostListFolder } from '../../../mcp-servers/mcp-host-list-folder'
 import { withMcpAgentProblems } from '../../../mcp-servers/mcp-agent-problems'
+import { sharedMcpProcesses } from '../../../mcp-servers/shared-process/shared-mcp-processes'
 import { defineMethod, type RpcContext } from '../core'
 import { botToolServerOf, toolsHomeFor } from './bots-tools'
 import {
@@ -59,6 +60,8 @@ export async function onHost<T>(
   const result = await work()
   if (changes) {
     context.runtime.notifyMcpServersChanged()
+    // A shared server removed, unshared or edited stops now, not on its next request.
+    void sharedMcpProcesses.reconcile(mcpHostListFolder()).catch(() => {})
   }
   return result
 }
